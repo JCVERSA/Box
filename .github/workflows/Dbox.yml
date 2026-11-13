@@ -1,0 +1,287 @@
+name: Linux Remote Workspace
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: 'Session duration in minutes before auto-shutdown (default ~2 hours)'
+        required: false
+        default: '240'
+        type: string
+      enable_browser_ssh:
+        description: 'Start optional browser-based SSH web terminal'
+        required: false
+        default: true
+        type: boolean
+      hostname:
+        description: 'Tailscale hostname for this workspace'
+        required: false
+        default: 'gh-workspace'
+        type: string
+      reset_cache:
+        description: 'Start clean (skip restoring previous workspace cache)'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: linux-remote-workspace
+  cancel-in-progress: false
+
+jobs:
+  workspace:
+    name: Ubuntu Workspace (${{ inputs.hostname || 'gh-workspace' }})
+    runs-on: ubuntu-latest
+    # Hard safety ceiling (+5 mins above default 240m so cache save always completes)
+    timeout-minutes: 245
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Prepare Workspace & APT Cache Directories
+        run: |
+          mkdir -p /home/runner/workspace /home/runner/.local/bin /home/runner/.config
+          sudo mkdir -p /var/cache/apt/archives
+          sudo chown -R runner:runner /var/cache/apt/archives
+
+      - name: Restore Persistent Workspace & Package Cache
+        id: cache_restore
+        if: ${{ !inputs.reset_cache }}
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /home/runner/workspace
+            /home/runner/.local
+            /home/runner/.config
+            /home/runner/.bashrc
+            /home/runner/.tmux.conf
+            /var/cache/apt/archives
+            /home/runner/.cache/pip
+            /home/runner/.npm
+          key: linux-workspace-state-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            linux-workspace-state-${{ runner.os }}-
+
+      - name: Configure OpenSSH Server, SFTP, Packages & Stop Helper
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          if [ -z "${SSH_PASSWORD}" ]; then
+            echo "::error::Missing secret SSH_PASSWORD. Add it in Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+          echo "::group::Installing SSH server, SFTP & workspace packages (using cached .debs when available)"
+          # Keep downloaded .deb archives in /var/cache/apt/archives so actions/cache persists them
+          echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/99keep-debs
+          sudo rm -f /etc/apt/apt.conf.d/docker-clean
+
+          sudo apt-get update -qq
+          EXTRA_PKGS=""
+          if [ -f /home/runner/workspace/.apt-packages.list ]; then
+            EXTRA_PKGS=$(tr '\n' ' ' < /home/runner/workspace/.apt-packages.list)
+            echo "Restoring user-saved APT packages: ${EXTRA_PKGS}"
+          fi
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            -o Dir::Cache::Archives="/var/cache/apt/archives" \
+            openssh-server tmux htop ripgrep jq tree curl vim git build-essential ${EXTRA_PKGS}
+          echo "::endgroup::"
+
+          echo "::group::Configuring OpenSSH & SFTP for user 'runner'"
+          sudo mkdir -p /var/run/sshd
+          echo "runner:${SSH_PASSWORD}" | sudo chpasswd
+
+          sudo tee /etc/ssh/sshd_config.d/99-workspace.conf > /dev/null <<'EOF'
+          PasswordAuthentication yes
+          PubkeyAuthentication yes
+          PermitRootLogin no
+          X11Forwarding no
+          ClientAliveInterval 30
+          ClientAliveCountMax 6
+          Subsystem sftp /usr/lib/openssh/sftp-server
+          EOF
+
+          # Default interactive SSH sessions into /home/runner/workspace
+          if ! grep -q "cd /home/runner/workspace" /home/runner/.bashrc 2>/dev/null; then
+            echo 'cd /home/runner/workspace 2>/dev/null || true' >> /home/runner/.bashrc
+          fi
+
+          # Create 'stop-workspace' helper command for clean shutdown
+          sudo tee /usr/local/bin/stop-workspace > /dev/null <<'EOF'
+          #!/usr/bin/env bash
+          echo "🛑 Signaling workspace to stop cleanly and save persistent cache..."
+          touch /tmp/stop-workspace
+          sync
+          echo "✅ Shutdown signal sent. Disconnecting in ~3 seconds so cache upload can finish."
+          EOF
+          sudo chmod +x /usr/local/bin/stop-workspace
+
+          # Create 'save-apt-package' helper so extra packages persist across runs
+          sudo tee /usr/local/bin/save-apt-package > /dev/null <<'EOF'
+          #!/usr/bin/env bash
+          set -e
+          if [ $# -eq 0 ]; then
+            echo "Usage: save-apt-package <package1> [package2...]"
+            exit 1
+          fi
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dir::Cache::Archives="/var/cache/apt/archives" "$@"
+          mkdir -p /home/runner/workspace
+          for pkg in "$@"; do
+            grep -qxF "$pkg" /home/runner/workspace/.apt-packages.list 2>/dev/null || echo "$pkg" >> /home/runner/workspace/.apt-packages.list
+          done
+          echo "✅ Installed and recorded $* in ~/workspace/.apt-packages.list for future runs."
+          EOF
+          sudo chmod +x /usr/local/bin/save-apt-package
+
+          sudo systemctl restart ssh
+          echo "::endgroup::"
+
+      - name: Connect to Tailscale Network
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: ${{ inputs.hostname || 'gh-workspace' }}
+          args: --ssh --accept-routes
+
+      - name: Capture Tailscale IP & MagicDNS Address
+        id: ts_info
+        run: |
+          for i in {1..15}; do
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -n 1 || true)
+            [ -n "${TS_IP}" ] && break
+            sleep 1
+          done
+          if [ -z "${TS_IP}" ]; then
+            echo "::error::Failed to obtain Tailscale IPv4 address. Verify TAILSCALE_AUTHKEY is valid."
+            exit 1
+          fi
+          TS_DNS=$(tailscale status --json | jq -r '.Self.DNSName // empty' | sed 's/\.$//')
+          [ -z "${TS_DNS}" ] && TS_DNS="${{ inputs.hostname || 'gh-workspace' }}"
+          echo "ts_ip=${TS_IP}" >> "$GITHUB_OUTPUT"
+          echo "ts_dns=${TS_DNS}" >> "$GITHUB_OUTPUT"
+
+      - name: Start Optional Browser-Based SSH Terminal (ttyd over Tailscale)
+        id: browser_ssh
+        if: ${{ inputs.enable_browser_ssh }}
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          echo "::group::Installing & launching ttyd browser terminal"
+          curl -fsSL https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64 -o /usr/local/bin/ttyd
+          sudo chmod +x /usr/local/bin/ttyd
+          TS_IP="${{ steps.ts_info.outputs.ts_ip }}"
+          # Bind ttyd strictly to the private Tailscale interface on port 7681
+          nohup ttyd --interface "${TS_IP}" --port 7681 --writable \
+            --credential "runner:${SSH_PASSWORD}" \
+            /bin/bash -c "cd /home/runner/workspace && exec /bin/bash -l" \
+            > /tmp/ttyd.log 2>&1 &
+          sleep 1
+          BROWSER_URL="http://${TS_IP}:7681"
+          echo "browser_url=${BROWSER_URL}" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+          echo "🌐 Browser Terminal active at: ${BROWSER_URL} (login: runner / your SSH_PASSWORD)"
+
+      - name: Publish Connection Details to Log & Workflow Summary
+        id: summary
+        run: |
+          TS_IP="${{ steps.ts_info.outputs.ts_ip }}"
+          TS_DNS="${{ steps.ts_info.outputs.ts_dns }}"
+          BROWSER_URL="${{ steps.browser_ssh.outputs.browser_url || 'Disabled (enable_browser_ssh = false)' }}"
+          CACHE_HIT="${{ steps.cache_restore.outputs.cache-hit || 'restored-from-prefix' }}"
+          DURATION="${{ inputs.session_minutes || '240' }}"
+
+          echo ""
+          echo "================================================================================"
+          echo " 🚀 LINUX WORKSPACE ONLINE OVER TAILSCALE"
+          echo "================================================================================"
+          echo " Tailscale IPv4     : ${TS_IP}"
+          echo " Tailscale Hostname : ${TS_DNS}"
+          echo " SSH Command        : ssh runner@${TS_IP}   (or: ssh runner@${TS_DNS})"
+          echo " SFTP Command       : sftp runner@${TS_IP}:/home/runner/workspace"
+          echo " Browser SSH        : ${BROWSER_URL}"
+          echo " Auth Password      : Value of your SSH_PASSWORD secret"
+          echo " Persistent Folder  : /home/runner/workspace"
+          echo " Auto-Shutdown      : ${DURATION} minutes"
+          echo " Clean Stop Command : Run 'stop-workspace' inside the shell (or touch /tmp/stop-workspace)"
+          echo "================================================================================"
+          echo ""
+
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          ## 🟢 Linux Workspace Online (`${TS_DNS}`)
+
+          | Access Method | Command / Address | Notes |
+          | :--- | :--- | :--- |
+          | **Tailscale IPv4** | `${TS_IP}` | Private Tailnet address |
+          | **Tailscale MagicDNS** | `${TS_DNS}` | Hostname on your Tailnet |
+          | **SSH Terminal** | `ssh runner@${TS_IP}` | Uses `SSH_PASSWORD` secret |
+          | **SFTP File Transfer** | `sftp runner@${TS_IP}:/home/runner/workspace` | Standard SFTP on port 22 |
+          | **SCP Upload / Download** | `scp -r ./local-dir runner@${TS_IP}:~/workspace/` | Copy files in or out |
+          | **Browser SSH Session** | `${BROWSER_URL}` | Optional browser terminal |
+          | **Stop Session Cleanly** | `stop-workspace` | Or `touch /tmp/stop-workspace` |
+
+          ### 💾 Persistence & Package Cache
+          - **Persistent Workspace Directory:** `/home/runner/workspace` (all files inside are saved between runs)
+          - **APT Package Cache:** `/var/cache/apt/archives` is cached automatically. Use `save-apt-package <pkg>` to auto-reinstall custom packages on future runs.
+          - **Auto-Shutdown Timer:** Automatically stops and saves cache after **${DURATION} minutes**.
+          EOF
+
+      - name: Keep Workspace Alive (Clean Stop or ~2h Auto-Shutdown)
+        run: |
+          MAX_MINS="${{ inputs.session_minutes || '240' }}"
+          # Validate numeric fallback
+          if ! [[ "${MAX_MINS}" =~ ^[0-9]+$ ]]; then
+            MAX_MINS=240
+          fi
+          TOTAL_SECONDS=$((MAX_MINS * 60))
+          ELAPSED=0
+          TS_IP="${{ steps.ts_info.outputs.ts_ip }}"
+
+          echo "⏳ Workspace active for up to ${MAX_MINS} minutes. Waiting for SSH/SFTP connections on ${TS_IP}..."
+          echo "💡 Tip: Run 'stop-workspace' inside SSH/web terminal anytime to finish early and save cache."
+
+          while [ "${ELAPSED}" -lt "${TOTAL_SECONDS}" ]; do
+            if [ -f /tmp/stop-workspace ]; then
+              echo ""
+              echo "🛑 Clean stop signal detected (/tmp/stop-workspace). Shutting down workspace gracefully..."
+              break
+            fi
+
+            if [ $((ELAPSED % 300)) -eq 0 ] && [ "${ELAPSED}" -gt 0 ]; then
+              REMAINING_MINS=$(( (TOTAL_SECONDS - ELAPSED) / 60 ))
+              ACTIVE_USERS=$(who | wc -l)
+              echo "⏱️ [Heartbeat] ${REMAINING_MINS}m remaining | Tailscale IP: ${TS_IP} | Active logins: ${ACTIVE_USERS} | Stop cleanly with: stop-workspace"
+            fi
+
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+          done
+
+          if [ "${ELAPSED}" -ge "${TOTAL_SECONDS}" ]; then
+            echo "⏰ Auto-shutdown timer (${MAX_MINS} minutes) reached. Closing workspace cleanly..."
+          fi
+
+          # Flush filesystem buffers before saving cache
+          sync
+
+      - name: Save Persistent Workspace & Package Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /home/runner/workspace
+            /home/runner/.local
+            /home/runner/.config
+            /home/runner/.bashrc
+            /home/runner/.tmux.conf
+            /var/cache/apt/archives
+            /home/runner/.cache/pip
+            /home/runner/.npm
+          key: linux-workspace-state-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Disconnect Tailscale Cleanly
+        if: always()
+        run: |
+          sudo tailscale logout || true
+          echo "✅ Workspace session ended and persistent cache saved."
