@@ -1,0 +1,315 @@
+name: Temporary Linux workspace
+run-name: ${{ inputs.mode == 'stop' && 'Stop Linux workspace' || 'Start Linux workspace' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Start a workspace or stop the current session
+        type: choice
+        required: true
+        default: start
+        options:
+          - start
+          - stop
+      browser_terminal:
+        description: Also start a browser SSH terminal (start only)
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: none
+
+jobs:
+  stop:
+    name: Stop workspace
+    if: ${{ inputs.mode == 'stop' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: none
+    steps:
+      - name: Cancel active workspace runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cancelled=()
+          workflow_file=remote-workspace.yml
+
+          for status in in_progress queued; do
+            mapfile -t run_ids < <(
+              gh api --paginate \
+                "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_file}/runs?status=${status}&per_page=100" \
+                --jq '.workflow_runs[] | select(.display_title == "Start Linux workspace") | .id'
+            )
+
+            for run_id in "${run_ids[@]}"; do
+              [[ -z "$run_id" || "$run_id" == "$GITHUB_RUN_ID" ]] && continue
+              case "$run_id" in
+                *[!0-9]*) echo "Skipping unexpected run ID: $run_id"; continue ;;
+              esac
+
+              echo "Requesting cancellation for workspace run $run_id ($status)."
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/cancel" >/dev/null
+              cancelled+=("$run_id")
+            done
+          done
+
+          if ((${#cancelled[@]} == 0)); then
+            echo "No active workspace run found."
+          else
+            printf 'Cancellation requested for run(s): %s\n' "${cancelled[*]}"
+            echo "Waiting for the workspace runner to finish its cleanup and cache save."
+
+            for run_id in "${cancelled[@]}"; do
+              for attempt in {1..72}; do
+                status="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq '.status')"
+                [[ "$status" == "completed" ]] && break
+                sleep 5
+              done
+
+              if [[ "${status:-unknown}" == "completed" ]]; then
+                echo "Workspace run $run_id has stopped."
+              else
+                echo "Workspace run $run_id is still stopping; GitHub will finish terminating it."
+              fi
+            done
+          fi
+
+          {
+            echo '## Workspace stopped'
+            echo
+            if ((${#cancelled[@]} == 0)); then
+              echo 'No active or queued workspace session was found.'
+            else
+              echo 'Cancellation was requested. The session runner was given time to clean up and save its workspace cache.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  workspace:
+    name: Start workspace
+    if: ${{ inputs.mode == 'start' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 135
+    concurrency:
+      group: temporary-linux-workspace
+      cancel-in-progress: false
+    steps:
+      - name: Prepare workspace and package cache directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p \
+            "$HOME/workspace" \
+            "$HOME/.cache/pip" \
+            "$HOME/.cache/yarn" \
+            "$HOME/.npm" \
+            "$HOME/.local/share/pnpm/store" \
+            "$HOME/.cargo/registry" \
+            "$HOME/.cargo/git" \
+            "$HOME/.m2/repository" \
+            "$HOME/.gradle/caches"
+
+      - name: Restore workspace and package caches
+        id: workspace-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/workspace
+            ~/.cache/pip
+            ~/.cache/yarn
+            ~/.npm
+            ~/.local/share/pnpm/store
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.m2/repository
+            ~/.gradle/caches
+          key: nomad-${{ github.repository_id }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            nomad-${{ github.repository_id }}-${{ runner.os }}-
+
+      - name: Join Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: gha-workspace-${{ github.run_id }}
+
+      - name: Configure password SSH and SFTP
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$SSH_PASSWORD" ]]; then
+            echo '::error::Add the SSH_PASSWORD repository secret before starting a workspace.'
+            exit 1
+          fi
+
+          if [[ "$SSH_PASSWORD" == *$'\n'* || "$SSH_PASSWORD" == *$'\r'* || "$SSH_PASSWORD" == *:* ]]; then
+            echo '::error::SSH_PASSWORD must be a single line without colons. Use a generated base64 password.'
+            exit 1
+          fi
+
+          workspace_user="$(id -un)"
+          workspace_home="$HOME"
+          workspace_dir="$HOME/workspace"
+          tailscale_ip="$(sudo tailscale ip -4 | head -n 1)"
+
+          if [[ -z "$tailscale_ip" ]]; then
+            echo '::error::Tailscale did not return an IPv4 address.'
+            exit 1
+          fi
+
+          password_hash="$(printf '%s' "$SSH_PASSWORD" | openssl passwd -6 -stdin)"
+          unset SSH_PASSWORD
+          sudo usermod --password "$password_hash" "$workspace_user"
+          unset password_hash
+
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server
+
+          sudo tee /etc/ssh/sshd_config.d/00-remote-workspace.conf >/dev/null <<EOF
+          AddressFamily inet
+          ListenAddress ${tailscale_ip}
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication no
+          AuthenticationMethods password
+          PermitRootLogin no
+          AllowUsers ${workspace_user}
+          PubkeyAuthentication no
+          AllowAgentForwarding no
+          AllowTcpForwarding no
+          X11Forwarding no
+          ClientAliveInterval 60
+          ClientAliveCountMax 3
+          EOF
+
+          sudo sshd -t
+          sudo systemctl enable --now ssh
+
+          {
+            echo "WORKSPACE_USER=${workspace_user}"
+            echo "WORKSPACE_HOME=${workspace_home}"
+            echo "WORKSPACE_DIR=${workspace_dir}"
+            echo "TAILSCALE_IP=${tailscale_ip}"
+          } >> "$GITHUB_ENV"
+
+      - name: Start optional browser SSH terminal
+        if: ${{ inputs.browser_terminal }}
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ttyd_path="$RUNNER_TEMP/ttyd.x86_64"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 \
+            --output "$ttyd_path"
+          echo '8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55  '"$ttyd_path" | sha256sum --check --status
+          sudo install -m 0755 "$ttyd_path" /usr/local/bin/ttyd
+
+          nohup ttyd \
+            --writable \
+            --interface 127.0.0.1 \
+            --port 7681 \
+            --credential "${WORKSPACE_USER}:${SSH_PASSWORD}" \
+            --cwd "$WORKSPACE_DIR" \
+            /bin/bash -l \
+            > "$RUNNER_TEMP/ttyd.log" 2>&1 &
+
+          for attempt in {1..20}; do
+            http_code="$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:7681/ || true)"
+            if [[ "$http_code" == '200' || "$http_code" == '401' ]]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ "${http_code:-}" != '200' && "${http_code:-}" != '401' ]]; then
+            cat "$RUNNER_TEMP/ttyd.log"
+            echo '::error::The browser terminal did not start.'
+            exit 1
+          fi
+
+          sudo tailscale serve --bg --https=443 --yes http://127.0.0.1:7681
+          tailscale_dns="$(sudo tailscale status --json | jq -r '.Self.DNSName // empty' | sed 's/\.$//')"
+
+          if [[ -z "$tailscale_dns" ]]; then
+            echo '::error::Tailscale did not report a MagicDNS name for the browser terminal.'
+            exit 1
+          fi
+
+          echo "BROWSER_URL=https://${tailscale_dns}/" >> "$GITHUB_ENV"
+          unset SSH_PASSWORD
+
+      - name: Print connection details and workflow summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Workspace files: ${WORKSPACE_DIR}"
+          echo "Tailscale IPv4: ${TAILSCALE_IP}"
+          echo "SSH: ssh ${WORKSPACE_USER}@${TAILSCALE_IP}"
+          echo "SFTP: sftp ${WORKSPACE_USER}@${TAILSCALE_IP}"
+
+          {
+            echo '# Temporary Linux workspace is ready'
+            echo
+            echo "- **Tailscale IPv4:** \`${TAILSCALE_IP}\`"
+            echo "- **SSH:** \`ssh ${WORKSPACE_USER}@${TAILSCALE_IP}\`"
+            echo "- **SFTP:** \`sftp ${WORKSPACE_USER}@${TAILSCALE_IP}\`"
+            echo "- **Workspace directory:** \`${WORKSPACE_DIR}\`"
+            if [[ -n "${BROWSER_URL:-}" ]]; then
+              echo "- **Browser terminal:** [Open over Tailscale](${BROWSER_URL}) (sign in as \`${WORKSPACE_USER}\` with the SSH password)"
+            else
+              echo '- **Browser terminal:** Disabled for this run.'
+            fi
+            echo
+            echo 'Use the SSH password stored in the `SSH_PASSWORD` repository secret. SFTP uses the same account and password.'
+            echo
+            echo 'The session stays available for about two hours. In Actions, run this workflow again with **mode: stop** to end it sooner; the stop job waits for cleanup and a cache save.'
+            echo
+            echo 'Files in `~/workspace` and the listed package caches are restored on the next run. Caches are branch-scoped, subject to GitHub cache quotas/eviction, and are not a secure place for credentials or private keys.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the workspace available for two hours
+        timeout-minutes: 120
+        shell: bash
+        run: |
+          echo 'The workspace is accepting Tailscale connections. It will close automatically after two hours.'
+          sleep 7200
+
+      - name: Stop local listeners
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +e
+          sudo tailscale serve reset >/dev/null 2>&1 || true
+          sudo systemctl stop ssh >/dev/null 2>&1 || true
+          if [[ -n "${RUNNER_TEMP:-}" ]]; then
+            pkill -u "$(id -un)" -x ttyd >/dev/null 2>&1 || true
+          fi
+
+      - name: Save workspace and package caches
+        if: ${{ always() && steps.workspace-cache.outputs.cache-primary-key != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/workspace
+            ~/.cache/pip
+            ~/.cache/yarn
+            ~/.npm
+            ~/.local/share/pnpm/store
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.m2/repository
+            ~/.gradle/caches
+          key: ${{ steps.workspace-cache.outputs.cache-primary-key }}
+  
