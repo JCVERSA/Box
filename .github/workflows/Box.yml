@@ -1,0 +1,411 @@
+name: Windows Remote Development
+run-name: Remote Windows / Node ${{ inputs.node_version }} / Java ${{ inputs.java_version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: Node.js version for this session
+        required: true
+        type: choice
+        default: "24"
+        options:
+          - "22"
+          - "24"
+      java_version:
+        description: Temurin JDK version for this session
+        required: true
+        type: choice
+        default: "25"
+        options:
+          - "17"
+          - "21"
+          - "25"
+      session_hours:
+        description: Active desktop window. Four hours leaves time for snapshot upload.
+        required: true
+        type: choice
+        default: "4"
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+      extra_tools:
+        description: Optional allowlisted Chocolatey IDs, comma separated
+        required: false
+        type: string
+        default: ""
+      restore_state:
+        description: Restore the latest non-expired snapshot
+        required: true
+        type: boolean
+        default: true
+      persist_state:
+        description: Save workspace and supported app preferences at the end
+        required: true
+        type: boolean
+        default: true
+      state_retention:
+        description: Days to retain the snapshot artifact
+        required: true
+        type: choice
+        default: "30"
+        options:
+          - "7"
+          - "14"
+          - "30"
+      install_android_studio:
+        description: Install Android Studio if it is not already present
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: windows-remote-dev
+  cancel-in-progress: false
+
+jobs:
+  workstation:
+    name: Windows remote workstation
+    runs-on: windows-2025
+    timeout-minutes: 360
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+
+      - name: Require a private repository for saved state
+        if: ${{ inputs.persist_state || inputs.restore_state }}
+        shell: pwsh
+        env:
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if ($env:REPOSITORY_PRIVATE -ne 'true') {
+            throw 'Saved workspace state must stay in a private repository. Make this repository private or turn off both restore_state and persist_state.'
+          }
+
+      - name: Validate required credentials
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw 'Add the RDP_PASSWORD repository secret.' }
+          if ($env:RDP_PASSWORD.Length -lt 12) { throw 'RDP_PASSWORD must be at least 12 characters.' }
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) { throw 'Add the TAILSCALE_AUTHKEY repository secret.' }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node_version }}
+          package-manager-cache: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+
+      - name: Make selected runtimes available to the RDP desktop
+        shell: pwsh
+        run: |
+          $nodeCommand = Get-Command node.exe -ErrorAction Stop | Select-Object -First 1
+          $nodeDirectory = Split-Path -Parent $nodeCommand.Source
+          $javaHome = $env:JAVA_HOME
+          if ([string]::IsNullOrWhiteSpace($javaHome)) { throw 'JAVA_HOME was not set by setup-java.' }
+          $toolDirectories = @($nodeDirectory, (Join-Path $javaHome 'bin'))
+          foreach ($scope in @('Machine', 'User')) {
+            $currentPath = [Environment]::GetEnvironmentVariable('Path', $scope)
+            $parts = @($currentPath -split ';' | Where-Object { $_ })
+            foreach ($directory in $toolDirectories) {
+              if ($parts -notcontains $directory) { $parts = @($directory) + $parts }
+            }
+            [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), $scope)
+            [Environment]::SetEnvironmentVariable('JAVA_HOME', $javaHome, $scope)
+            [Environment]::SetEnvironmentVariable('NODE_HOME', $nodeDirectory, $scope)
+          }
+          node --version
+          java --version
+
+      - name: Install desktop apps and requested extras
+        shell: pwsh
+        env:
+          EXTRA_TOOLS: ${{ inputs.extra_tools }}
+          INSTALL_ANDROID_STUDIO: ${{ inputs.install_android_studio }}
+        run: |
+          $packages = [System.Collections.Generic.List[string]]::new()
+          if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) { $packages.Add('git') }
+          if (-not (Get-Command code.cmd -ErrorAction SilentlyContinue)) { $packages.Add('vscode') }
+          if (-not (Test-Path (Join-Path $env:ProgramFiles 'Mozilla Firefox\firefox.exe'))) { $packages.Add('firefox') }
+          $studioPath = Join-Path $env:ProgramFiles 'Android\Android Studio\bin\studio64.exe'
+          if ($env:INSTALL_ANDROID_STUDIO -eq 'true' -and -not (Test-Path $studioPath)) { $packages.Add('androidstudio') }
+
+          $allowedTools = @{
+            'python' = 'python'
+            'postman' = 'postman'
+            '7zip' = '7zip'
+            'terraform' = 'terraform'
+            'cmake' = 'cmake'
+            'golang' = 'golang'
+          }
+          $requestedTools = @()
+          if (-not [string]::IsNullOrWhiteSpace($env:EXTRA_TOOLS)) {
+            $requestedTools = @($env:EXTRA_TOOLS -split ',' | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+          }
+          $unknownTools = @($requestedTools | Where-Object { -not $allowedTools.ContainsKey($_) })
+          if ($unknownTools.Count -gt 0) { throw "Unsupported extra tool(s): $($unknownTools -join ', '). Allowed values: python, postman, 7zip, terraform, cmake, golang." }
+          foreach ($tool in $requestedTools) {
+            $package = $allowedTools[$tool]
+            if (-not $packages.Contains($package)) { $packages.Add($package) }
+          }
+          if ($packages.Count -gt 0) {
+            if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) { throw 'Chocolatey is not available on this Windows runner.' }
+            & choco.exe install $packages.ToArray() --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "Chocolatey failed with exit code $LASTEXITCODE." }
+          }
+          $desktopBins = @(
+            (Join-Path (Join-Path $env:ProgramData 'chocolatey') 'bin'),
+            (Join-Path (Join-Path $env:ProgramFiles 'Microsoft VS Code') 'bin')
+          )
+          foreach ($directory in $desktopBins) {
+            if (Test-Path $directory) {
+              $env:Path = "$directory;$env:Path"
+              Add-Content -Path $env:GITHUB_PATH -Value $directory
+            }
+          }
+
+      - name: Find the most recent retained snapshot
+        id: previous
+        if: ${{ inputs.restore_state }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $workflowApi = "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/actions/workflows/windows-remote-dev.yml"
+          $runs = Invoke-RestMethod -Uri "$workflowApi/runs?per_page=100" -Headers $headers
+          $snapshotRunId = ''
+          foreach ($run in $runs.workflow_runs) {
+            if ($run.id -eq [long]$env:GITHUB_RUN_ID) { continue }
+            if ($run.conclusion -notin @('success', 'failure', 'cancelled', 'timed_out')) { continue }
+            try {
+              $artifacts = Invoke-RestMethod -Uri "$workflowApi/runs/$($run.id)/artifacts?per_page=100" -Headers $headers
+            } catch {
+              continue
+            }
+            $snapshot = $artifacts.artifacts | Where-Object { $_.name -eq 'windows-remote-state' -and -not $_.expired } | Select-Object -First 1
+            if ($snapshot) { $snapshotRunId = [string]$run.id; break }
+          }
+          "run_id=$snapshotRunId" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ([string]::IsNullOrWhiteSpace($snapshotRunId)) { Write-Output 'No retained snapshot was found; starting with the repository checkout.' }
+
+      - name: Download the previous snapshot
+        id: download-state
+        if: ${{ inputs.restore_state && steps.previous.outputs.run_id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-remote-state
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.previous.outputs.run_id }}
+          path: ${{ runner.temp }}/previous-state
+
+      - name: Restore the workspace and supported app settings
+        if: ${{ steps.download-state.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $stateRoot = Join-Path $env:RUNNER_TEMP 'previous-state'
+          $workspaceSource = Join-Path $stateRoot 'workspace'
+          if (Test-Path $workspaceSource) {
+            & robocopy.exe $workspaceSource $env:GITHUB_WORKSPACE /E /COPY:DAT /R:1 /W:1
+            if ($LASTEXITCODE -ge 8) { throw "Workspace restore failed with robocopy exit code $LASTEXITCODE." }
+          }
+
+          $savedApps = Join-Path $stateRoot 'apps'
+          New-Item -ItemType Directory -Path $savedApps -Force | Out-Null
+          $codeSource = Join-Path $savedApps 'vscode'
+          $codeTarget = Join-Path $env:APPDATA 'Code\User'
+          if (Test-Path $codeSource) {
+            New-Item -ItemType Directory -Path $codeTarget -Force | Out-Null
+            foreach ($file in @('settings.json', 'keybindings.json')) {
+              $sourceFile = Join-Path $codeSource $file
+              if (Test-Path $sourceFile) { Copy-Item $sourceFile -Destination $codeTarget -Force }
+            }
+            $snippets = Join-Path $codeSource 'snippets'
+            if (Test-Path $snippets) { Copy-Item $snippets -Destination $codeTarget -Recurse -Force }
+          }
+
+          $firefoxSource = Join-Path $savedApps 'firefox'
+          $firefoxTarget = Join-Path $env:APPDATA 'Mozilla\Firefox'
+          if (Test-Path $firefoxSource) {
+            New-Item -ItemType Directory -Path $firefoxTarget -Force | Out-Null
+            $profilesIni = Join-Path $firefoxSource 'profiles.ini'
+            if (Test-Path $profilesIni) { Copy-Item $profilesIni -Destination $firefoxTarget -Force }
+            $profilesSource = Join-Path $firefoxSource 'Profiles'
+            if (Test-Path $profilesSource) {
+              $profilesTarget = Join-Path $firefoxTarget 'Profiles'
+              New-Item -ItemType Directory -Path $profilesTarget -Force | Out-Null
+              foreach ($profile in Get-ChildItem $profilesSource -Directory) {
+                $profileTarget = Join-Path $profilesTarget $profile.Name
+                New-Item -ItemType Directory -Path $profileTarget -Force | Out-Null
+                foreach ($file in @('prefs.js', 'user.js', 'extensions.json', 'xulstore.json', 'containers.json', 'handlers.json', 'search.json.mozlz4')) {
+                  $sourceFile = Join-Path $profile.FullName $file
+                  if (Test-Path $sourceFile) { Copy-Item $sourceFile -Destination $profileTarget -Force }
+                }
+                $extensions = Join-Path $profile.FullName 'extensions'
+                if (Test-Path $extensions) { Copy-Item $extensions -Destination $profileTarget -Recurse -Force }
+              }
+            }
+          }
+
+          $androidSource = Join-Path $savedApps 'android-studio'
+          $googleTarget = Join-Path $env:APPDATA 'Google'
+          if (Test-Path $androidSource) {
+            New-Item -ItemType Directory -Path $googleTarget -Force | Out-Null
+            foreach ($profile in Get-ChildItem $androidSource -Directory) { Copy-Item $profile.FullName -Destination $googleTarget -Recurse -Force }
+          }
+
+          $extensionList = Join-Path $savedApps 'vscode-extensions.txt'
+          $codeCommand = Get-Command code.cmd -ErrorAction SilentlyContinue
+          if (-not $codeCommand) { $codeCommand = Get-Command code -ErrorAction SilentlyContinue }
+          if ($codeCommand -and (Test-Path $extensionList)) {
+            $extensionIds = Get-Content $extensionList | Where-Object { $_ -match '^[A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z0-9][A-Za-z0-9._-]*$' }
+            foreach ($extensionId in $extensionIds) {
+              & $codeCommand.Source --install-extension $extensionId --force --quiet
+              if ($LASTEXITCODE -ne 0) { Write-Warning "Could not restore VS Code extension $extensionId." }
+            }
+          }
+
+      - name: Join the private tailnet
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: gh-win-${{ github.run_id }}
+
+      - name: Enable NLA-protected RDP for Tailscale peers only
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $account = Get-LocalUser -Name 'runneradmin' -ErrorAction Stop
+          Set-LocalUser -Name $account.Name -Password $securePassword
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $account.Name -ErrorAction SilentlyContinue
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
+          Set-Service -Name TermService -StartupType Manual
+          Start-Service -Name TermService
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue | Disable-NetFirewallRule
+          Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultInboundAction Block
+          Get-NetFirewallRule -DisplayName 'RDP over Tailscale only' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName 'RDP over Tailscale only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress @('100.64.0.0/10', 'fd7a:115c:a1e0::/48') -Profile Any | Out-Null
+
+      - name: Print private connection details
+        shell: pwsh
+        run: |
+          $address = (tailscale ip -4 | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($address)) { throw 'Tailscale did not report an IPv4 address.' }
+          Write-Output ('RDP address: {0}:3389' -f $address)
+          Write-Output 'RDP user: runneradmin'
+          Write-Output 'Use the RDP_PASSWORD secret when prompted. The password is never printed.'
+
+      - name: Keep the desktop available
+        shell: pwsh
+        env:
+          SESSION_HOURS: ${{ inputs.session_hours }}
+        run: |
+          $seconds = [int]$env:SESSION_HOURS * 60 * 60
+          Write-Output "The desktop will remain available for $($env:SESSION_HOURS) hour(s). Cancel this run from Actions to end early."
+          Start-Sleep -Seconds $seconds
+
+      - name: Capture workspace and app preferences
+        if: ${{ always() && inputs.persist_state && github.event.repository.private == true }}
+        shell: pwsh
+        run: |
+          $stateRoot = Join-Path $env:RUNNER_TEMP 'remote-state'
+          New-Item -ItemType Directory -Path $stateRoot -Force | Out-Null
+          $workspaceTarget = Join-Path $stateRoot 'workspace'
+          if (Test-Path $env:GITHUB_WORKSPACE) {
+            & robocopy.exe $env:GITHUB_WORKSPACE $workspaceTarget /E /COPY:DAT /R:1 /W:1 /XD .git node_modules .gradle .android .terraform .ssh .aws .azure .kube .gnupg /XF '.env' '.env.*' '.npmrc' '.pypirc' '.git-credentials' '.netrc' '*.pem' '*.pfx' '*.p12' '*.key' '*.keystore' 'id_rsa' 'id_ed25519'
+            if ($LASTEXITCODE -ge 8) { throw "Workspace snapshot failed with robocopy exit code $LASTEXITCODE." }
+          }
+
+          $appsRoot = Join-Path $stateRoot 'apps'
+          New-Item -ItemType Directory -Path $appsRoot -Force | Out-Null
+          $codeSource = Join-Path $env:APPDATA 'Code\User'
+          $codeTarget = Join-Path $appsRoot 'vscode'
+          if (Test-Path $codeSource) {
+            New-Item -ItemType Directory -Path $codeTarget -Force | Out-Null
+            foreach ($file in @('settings.json', 'keybindings.json')) {
+              $sourceFile = Join-Path $codeSource $file
+              if (Test-Path $sourceFile) { Copy-Item $sourceFile -Destination $codeTarget -Force }
+            }
+            $snippets = Join-Path $codeSource 'snippets'
+            if (Test-Path $snippets) { Copy-Item $snippets -Destination $codeTarget -Recurse -Force }
+          }
+
+          $codeCommand = Get-Command code.cmd -ErrorAction SilentlyContinue
+          if (-not $codeCommand) { $codeCommand = Get-Command code -ErrorAction SilentlyContinue }
+          if ($codeCommand) {
+            $extensionFile = Join-Path $appsRoot 'vscode-extensions.txt'
+            New-Item -ItemType Directory -Path $appsRoot -Force | Out-Null
+            & $codeCommand.Source --list-extensions 2>$null | Set-Content -Path $extensionFile -Encoding utf8
+          }
+
+          $firefoxRoot = Join-Path $env:APPDATA 'Mozilla\Firefox'
+          $firefoxTarget = Join-Path $appsRoot 'firefox'
+          $profiles = Join-Path $firefoxRoot 'Profiles'
+          if (Test-Path $profiles) {
+            New-Item -ItemType Directory -Path $firefoxTarget -Force | Out-Null
+            $profilesIni = Join-Path $firefoxRoot 'profiles.ini'
+            if (Test-Path $profilesIni) { Copy-Item $profilesIni -Destination $firefoxTarget -Force }
+            $savedProfiles = Join-Path $firefoxTarget 'Profiles'
+            New-Item -ItemType Directory -Path $savedProfiles -Force | Out-Null
+            foreach ($profile in Get-ChildItem $profiles -Directory) {
+              $profileTarget = Join-Path $savedProfiles $profile.Name
+              New-Item -ItemType Directory -Path $profileTarget -Force | Out-Null
+              foreach ($file in @('prefs.js', 'user.js', 'extensions.json', 'xulstore.json', 'containers.json', 'handlers.json', 'search.json.mozlz4')) {
+                $sourceFile = Join-Path $profile.FullName $file
+                if (Test-Path $sourceFile) { Copy-Item $sourceFile -Destination $profileTarget -Force }
+              }
+              $extensions = Join-Path $profile.FullName 'extensions'
+              if (Test-Path $extensions) { Copy-Item $extensions -Destination $profileTarget -Recurse -Force }
+            }
+          }
+
+          $googleRoot = Join-Path $env:APPDATA 'Google'
+          $androidTarget = Join-Path $appsRoot 'android-studio'
+          if (Test-Path $googleRoot) {
+            foreach ($profile in Get-ChildItem $googleRoot -Directory -Filter 'AndroidStudio*') {
+              New-Item -ItemType Directory -Path $androidTarget -Force | Out-Null
+              $profileTarget = Join-Path $androidTarget $profile.Name
+              New-Item -ItemType Directory -Path $profileTarget -Force | Out-Null
+              foreach ($folder in @('options', 'keymaps', 'codestyles', 'templates', 'inspection', 'colors', 'plugins')) {
+                $sourceFolder = Join-Path $profile.FullName $folder
+                if (Test-Path $sourceFolder) { Copy-Item $sourceFolder -Destination $profileTarget -Recurse -Force }
+              }
+            }
+          }
+
+          @{ saved_at_utc = [DateTime]::UtcNow.ToString('o'); run_id = $env:GITHUB_RUN_ID } | ConvertTo-Json | Set-Content -Path (Join-Path $stateRoot 'snapshot.json') -Encoding utf8
+
+      - name: Upload the session snapshot
+        if: ${{ always() && inputs.persist_state && github.event.repository.private == true }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-remote-state
+          path: ${{ runner.temp }}/remote-state
+          if-no-files-found: warn
+          retention-days: ${{ inputs.state_retention }}
+          compression-level: 1
+          include-hidden-files: true
